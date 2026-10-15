@@ -1,11 +1,13 @@
 import cors from "cors";
 import "dotenv/config";
 import express from "express";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import type { Readable } from "node:stream";
 import NodeMediaServer, { type NodeMediaSession } from "node-media-server";
+import type { Request } from "express";
 
 type LiveState = {
   isLive: boolean;
@@ -24,7 +26,12 @@ const env = {
   ffmpegPath: process.env.FFMPEG_PATH?.trim() || "ffmpeg",
   publicBaseUrl: (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, ""),
   corsOrigin: process.env.CORS_ORIGIN || "*",
+  trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
 };
+
+// HLS players re-fetch the live playlist every target duration (6s), so a
+// listener that hasn't fetched it within this window has stopped playing.
+const LISTENER_ACTIVE_WINDOW_MS = 20_000;
 
 const hlsPlaylistName = "live.m3u8";
 const hlsPlaylistPath = path.join(env.hlsOutputDir, hlsPlaylistName);
@@ -35,6 +42,10 @@ const playbackUrl = env.publicBaseUrl
 
 let ffmpegProcess: ChildProcessByStdio<null, Readable, Readable> | null = null;
 let ffmpegStopTimer: NodeJS.Timeout | null = null;
+
+// Listener key -> last playlist fetch (ms) for the current broadcast. The map
+// is cleared when a broadcast starts, so its size is the unique total.
+const listenerLastSeen = new Map<string, number>();
 
 const liveState: LiveState = {
   isLive: false,
@@ -49,6 +60,7 @@ cleanupHlsFiles();
 
 const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", env.trustProxy);
 app.use(cors({ origin: env.corsOrigin }));
 
 app.get("/health", (_req, res) => {
@@ -66,7 +78,13 @@ app.get("/api/live", (_req, res) => {
     playbackUrl,
     streamPath: liveState.streamPath,
     ffmpegRunning: liveState.ffmpegRunning,
+    listeners: getListenerStats(),
   });
+});
+
+app.get("/api/listeners", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ live: liveState.isLive, startedAt: liveState.startedAt, ...getListenerStats() });
 });
 
 app.use(
@@ -79,6 +97,9 @@ app.use(
 
       if (filePath.endsWith(".m3u8")) {
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+        if (liveState.isLive && path.basename(filePath) === hlsPlaylistName) {
+          recordListener(res.req);
+        }
       }
 
       if (filePath.endsWith(".ts")) {
@@ -124,6 +145,7 @@ mediaServer.on("postPublish", (session) => {
   liveState.publisherId = session.id;
 
   console.log(`Stream started: ${session.streamPath} from ${session.ip}`);
+  listenerLastSeen.clear();
   cleanupHlsFiles();
 
   setTimeout(() => {
@@ -138,7 +160,9 @@ mediaServer.on("donePublish", (session) => {
     return;
   }
 
-  console.log(`Stream ended: ${session.streamPath}`);
+  const { total } = getListenerStats();
+  console.log(`Stream ended: ${session.streamPath} (${total} unique listeners)`);
+  listenerLastSeen.clear();
   resetLiveState();
   stopFfmpeg();
 });
@@ -151,6 +175,37 @@ process.on("SIGTERM", shutdown);
 function parsePort(value: string | undefined, fallback: number) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseTrustProxy(value: string | undefined): boolean | number | string {
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed === "true") return true;
+  if (trimmed === "false") return false;
+  return /^\d+$/.test(trimmed) ? Number(trimmed) : trimmed;
+}
+
+// Players on the website pass a stable per-device `lid`; anything else (VLC,
+// direct links) falls back to IP + user agent so refetches aren't recounted.
+function getListenerKey(req: Request) {
+  const lid = req.query.lid;
+  if (typeof lid === "string" && /^[A-Za-z0-9-]{8,64}$/.test(lid)) {
+    return `lid:${lid}`;
+  }
+  const fingerprint = `${req.ip ?? ""}|${req.get("user-agent") ?? ""}`;
+  return `fp:${createHash("sha256").update(fingerprint).digest("hex").slice(0, 32)}`;
+}
+
+function recordListener(req: Request) {
+  listenerLastSeen.set(getListenerKey(req), Date.now());
+}
+
+function getListenerStats() {
+  const activeSince = Date.now() - LISTENER_ACTIVE_WINDOW_MS;
+  let current = 0;
+  for (const lastSeen of listenerLastSeen.values()) {
+    if (lastSeen >= activeSince) current += 1;
+  }
+  return { current, total: listenerLastSeen.size };
 }
 
 function isExpectedStream(session: NodeMediaSession) {

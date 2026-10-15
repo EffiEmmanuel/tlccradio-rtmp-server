@@ -10,6 +10,13 @@ Lightweight RTMP ingest service for TLCC audio-only live services. It accepts th
 - Health: `GET /health`
 - Basic status: `GET /api/status`
 - Detailed status: `GET /api/live`
+- Listener counts: `GET /api/listeners` → `{ live, startedAt, current, total }`
+
+## Listener counts
+
+Every fetch of `live.m3u8` during a broadcast marks that listener as active. HLS players refetch the playlist every few seconds, so `current` is the number of distinct listeners seen in the last 20 seconds. `total` is the number of distinct listeners since the broadcast started, and it resets when a new broadcast starts. Listeners are identified by the `lid` query parameter (the website player sends a per-device id), or by IP + user agent for other players such as VLC. Counts are kept in memory, so restarting the server resets them.
+
+Behind Nginx/Cloudflare, `TRUST_PROXY` (default `true`) makes the server use `X-Forwarded-For` for the client IP. It takes Express `trust proxy` values (`true`, `false`, a hop count, or `loopback`).
 
 ## Environment
 
@@ -24,6 +31,7 @@ HLS_OUTPUT_DIR=./public
 FFMPEG_PATH=/usr/bin/ffmpeg
 PUBLIC_BASE_URL=https://stream.church.org
 CORS_ORIGIN=*
+TRUST_PROXY=true
 ```
 
 ## Local Development
